@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL_VERSION = 1
@@ -1501,7 +1501,7 @@ def trial_now() -> tuple[int, str]:
             if raw.isdigit():
                 n = int(raw)
                 n = n // 1000 if n > 10**11 else n
-                return n, datetime.utcfromtimestamp(n).strftime("%Y-%m-%dT%H:%M:%SZ")
+                return n, datetime.fromtimestamp(n, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return FIXED_CREATED, "2026-01-01T00:00:00Z"
 
 
