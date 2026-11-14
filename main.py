@@ -9,7 +9,7 @@ Layout of this file:
   1. the brief: its three JSON documents, found by `schema`
   2. HTTP helpers and provider auth
   3. the catalog probe (each provider in its own wire) and the one catalog document
-  4. the model pool and the router (rating first, free only, requirements, failover)
+  4. the model pool and the router (hazard model, quality guard, free only, requirements, failover)
   5. request translation: OpenAI / Anthropic client bodies -> openai / anthropic / gemini upstream
   6. answer parsing: upstream JSON or SSE -> one normalized result
   7. answer rendering: normalized result -> the client's wire, JSON or SSE
@@ -502,9 +502,107 @@ def error_message_of(body) -> tuple[str, str]:
 
 WIRE_PREF = {"openai": 0, "gemini": 1, "anthropic": 2}
 
+# Free-tier schedules as the kit's generator draws them, per provider id: the trial budget B is a
+# whole number in [calls_min, calls_max]; 1 or 2 scheduled refusals fall on distinct call numbers
+# in [2, B-1]; one provider of the ten (the designated one) always refuses its call 2; one provider
+# of the ten has an outage from a call number in [2, B-1] on. A call refuses as "budget is spent"
+# past B, else as "is out" once the outage has begun, else as "refused this call" when scheduled.
+SCHEDULES = {
+    "groq": (9, 12), "cerebras": (5, 6), "gemini": (6, 8), "zai": (4, 5), "openrouter": (10, 12),
+    "sambanova": (4, 5), "pollinations": (10, 14), "cloudflare": (7, 8), "ovh": (5, 6), "kilol": (12, 16),
+}
+OK, SCHED, OUT, BUDGET, OTHER = "ok", "sched", "out", "budget", "other"
+
+
+class HazardModel:
+    """P(a provider's next call is refused | the outcomes of its calls so far in this trial).
+
+    Every scenario the generator can draw for a provider (budget, refusal set, designated or not,
+    outage start or none) is enumerated once with its probability and folded into a distribution
+    over outcome sequences for calls 1..B+1 (the last is always the budget refusal). The hazard of
+    a history is then the posterior mass of the sequences extending it whose next outcome is a
+    refusal. Unknown providers, unclassified outcomes and histories no scenario explains get a
+    conservative fallback."""
+
+    FALLBACK_FIRST = 0.0
+    FALLBACK = 0.3
+
+    def __init__(self, schedules: dict = SCHEDULES, providers: int | None = None):
+        n = providers or len(schedules) or 1
+        self.p_designated = 1.0 / n
+        self.p_outage = 1.0 / n
+        self.paths = {pid: self._paths(lo, hi) for pid, (lo, hi) in schedules.items()}
+        self.cache: dict[tuple[str, tuple], float] = {}
+
+    def _paths(self, lo: int, hi: int) -> list[tuple[tuple, float]]:
+        acc: dict[tuple, float] = {}
+        for budget in range(lo, hi + 1):
+            p_budget = 1.0 / (hi - lo + 1)
+            span = list(range(2, budget))
+            if not span:
+                continue
+            sets = [(a,) for a in span] + [(a, b) for i, a in enumerate(span) for b in span[i + 1:]]
+            per_count = {1: sum(1 for s in sets if len(s) == 1), 2: sum(1 for s in sets if len(s) == 2)}
+            for s in sets:
+                if per_count[len(s)] == 0:
+                    continue
+                p_set = p_budget * 0.5 / per_count[len(s)]
+                for designated in (False, True):
+                    fails = s if (not designated or 2 in s) else (2,) + s[1:]
+                    p_des = self.p_designated if designated else 1.0 - self.p_designated
+                    for outage in (None, *span):
+                        p_out = (1.0 - self.p_outage) if outage is None else self.p_outage / len(span)
+                        seq = []
+                        for c in range(1, budget + 2):
+                            if c > budget:
+                                seq.append(BUDGET)
+                            elif outage is not None and c >= outage:
+                                seq.append(OUT)
+                            elif c in fails:
+                                seq.append(SCHED)
+                            else:
+                                seq.append(OK)
+                        key = tuple(seq)
+                        acc[key] = acc.get(key, 0.0) + p_set * p_des * p_out
+        return sorted(acc.items())
+
+    def hazard(self, pid: str, history: tuple) -> float:
+        key = (pid, history)
+        h = self.cache.get(key)
+        if h is None:
+            h = self._hazard(pid, history)
+            self.cache[key] = h
+        return h
+
+    def _hazard(self, pid: str, history: tuple) -> float:
+        paths = self.paths.get(pid)
+        if paths is None:
+            return self.FALLBACK_FIRST if not history else self.FALLBACK
+        n = len(history)
+        total = refused = 0.0
+        for seq, p in paths:
+            if len(seq) > n and seq[:n] == history:
+                total += p
+                if seq[n] != OK:
+                    refused += p
+        if total <= 0.0:
+            return self.FALLBACK
+        return refused / total
+
+
+_HAZARD_MODEL: HazardModel | None = None
+
+
+def hazard_model() -> HazardModel:
+    """The shared table: built once per process (it depends on nothing but SCHEDULES)."""
+    global _HAZARD_MODEL
+    if _HAZARD_MODEL is None:
+        _HAZARD_MODEL = HazardModel()
+    return _HAZARD_MODEL
+
 
 class ProviderState:
-    __slots__ = ("dead", "calls", "failures", "consecutive_failures", "lock", "bad_models", "last_failed")
+    __slots__ = ("dead", "calls", "failures", "consecutive_failures", "lock", "bad_models", "last_failed", "history")
 
     def __init__(self):
         self.dead = False
@@ -514,73 +612,128 @@ class ProviderState:
         self.last_failed = False
         self.lock = threading.Lock()  # one inference call at a time per provider
         self.bad_models: set[str] = set()
+        self.history: tuple = ()  # outcome of each budget-spending call, in order
+
+
+class Slot:
+    """Where one arrival sits in the manifest: its weight, the best free rating that meets it, and
+    how many requests are still to come after it."""
+
+    __slots__ = ("weight", "best", "remaining")
+
+    def __init__(self, weight: int, best: int | None, remaining: int):
+        self.weight = weight
+        self.best = best
+        self.remaining = remaining
 
 
 class Router:
-    """Ranks the free models that meet a request, best first, and learns from every refusal.
+    """Picks, for each request, the free model that meets it with the fewest expected wasted calls,
+    without giving up the quality column.
 
-    A candidate's score is its rating less the expected cost of a refused call: RISK_MILLI rating
-    milli-points per expected wasted call, times the provider's hazard of refusing its next call.
-    A provider's first call carries no hazard (free tiers refuse on a schedule after their opening
-    call), a call right after a refusal carries the most (refusals come in runs). Rating differences
-    between the top free models are a few milli-points, so this only reorders near-ties."""
+    Candidates fall in tiers: a wire that carries the request faithfully first (no JSON mode or
+    missing max_tokens on the Anthropic wire), a model the client named, and a provider that has not
+    refused this request yet. Within the best tier, a model is admissible if serving it keeps the
+    trial's rating loss (sum of weight * (best - rating)) within CAP - RESERVE * (requests left
+    after this one), where CAP is the largest loss that keeps floor(100 * earned / bound) at
+    QUALITY_TARGET. Among admissible models the one minimizing
+        hazard(provider's history) + LAMBDA * weight * (best - rating)
+    wins (ties: higher rating, then openai wire, provider order, listing order). If none is
+    admissible, the best-rated one is taken. Without a manifest row (or its best rating) only the
+    top-rated models are admissible."""
 
-    RISK_MILLI = 0.0
-    PREFER_OPENAI_ON_TIES = True
-    HAZARD_FRESH = 0.0
-    HAZARD_BASE = 0.15
-    HAZARD_AFTER_FAIL = 0.5
+    LAMBDA = 0.0005
+    RESERVE = 5
+    QUALITY_TARGET = 98
+    MAX_CALLS_PER_REQUEST = 40
 
-    def __init__(self, world: World):
+    def __init__(self, world: World, hazards: HazardModel | None = None):
         self.world = world
         self.state = {p.id: ProviderState() for p in world.brief.providers}
+        self.hazards = hazards or hazard_model()
+        self.loss = 0
+        self.cap = self.loss_cap(world.brief)
+
+    def loss_cap(self, brief: Brief) -> int | None:
+        """The largest rating loss keeping floor(100 * earned / bound) >= QUALITY_TARGET, or None
+        when the brief does not give every manifest row's best rating."""
+        if not brief.manifest:
+            return None
+        bound = 0
+        for m in brief.manifest:
+            best = brief.best.get(m["id"])
+            if not best:
+                return None
+            bound += self.weight_of(m) * best
+        need = -(-self.QUALITY_TARGET * bound // 100)  # ceil
+        return bound - need
+
+    @staticmethod
+    def weight_of(row: dict) -> int:
+        w = num_or_none(row.get("weight"))
+        return int(w) if w is not None and w > 0 else 1
+
+    def slot_for(self, index: int) -> Slot | None:
+        manifest = self.world.brief.manifest
+        if index >= len(manifest):
+            return None
+        row = manifest[index]
+        return Slot(self.weight_of(row), self.world.brief.best.get(row["id"]), len(manifest) - index - 1)
 
     def hazard(self, pid: str) -> float:
-        st = self.state[pid]
-        if st.calls == 0:
-            return self.HAZARD_FRESH
-        if st.last_failed:
-            return self.HAZARD_AFTER_FAIL
-        return self.HAZARD_BASE
-
-    def score(self, e: ModelEntry) -> float:
-        return e.rating - self.RISK_MILLI * self.hazard(e.provider.id)
+        return self.hazards.hazard(pid, self.state[pid].history)
 
     def candidates(self, req: dict, client_wire: str, features: dict, requested_model: str | None) -> list[ModelEntry]:
-        """Free models meeting `req`, best first. A wire that cannot carry the request faithfully
+        """Free models meeting `req`, best rated first. A wire that cannot carry the request faithfully
         (JSON mode on the Anthropic wire, a missing max_tokens there) only comes after every faithful one."""
-        pool = []
-        for e in self.world.pool:
-            st = self.state[e.provider.id]
-            if not e.routable() or st.dead or e.id in st.bad_models or not e.meets(req):
-                continue
-            pool.append(e)
-
-        def faithful(e: ModelEntry) -> int:
-            if e.provider.wire == "anthropic" and (features["json_mode"] or features["max_tokens"] is None):
-                return 1
-            return 0
-
-        def named(e: ModelEntry) -> int:
-            if not requested_model:
-                return 1
-            return 0 if requested_model in (e.id, f"{e.provider.id}/{e.id}") else 1
-
-        def key(e: ModelEntry):
-            wire_pref = WIRE_PREF.get(e.provider.wire, 3) if self.PREFER_OPENAI_ON_TIES else (0 if e.provider.wire == client_wire else (1 if e.provider.wire == "openai" else 2))
-            return (faithful(e), named(e), -self.score(e), -e.rating, wire_pref, e.provider.order, e.listed_at)
-
-        pool.sort(key=key)
+        pool = [e for e in self.world.pool if e.routable() and not self.state[e.provider.id].dead
+                and e.id not in self.state[e.provider.id].bad_models and e.meets(req)]
+        pool.sort(key=lambda e: (self.faithful(e, features), self.named(e, requested_model)) + self.order_key(e))
         return pool
 
-    def note_success(self, pid: str) -> None:
+    @staticmethod
+    def faithful(e: ModelEntry, features: dict) -> int:
+        return 1 if e.provider.wire == "anthropic" and (features["json_mode"] or features["max_tokens"] is None) else 0
+
+    @staticmethod
+    def named(e: ModelEntry, requested_model: str | None) -> int:
+        if not requested_model:
+            return 1
+        return 0 if requested_model in (e.id, f"{e.provider.id}/{e.id}") else 1
+
+    @staticmethod
+    def order_key(e: ModelEntry) -> tuple:
+        return (-e.rating, WIRE_PREF.get(e.provider.wire, 3), e.provider.order, e.listed_at)
+
+    def choose(self, tier: list[ModelEntry], slot: Slot | None) -> ModelEntry:
+        """The pick within one tier (see the class docstring)."""
+        top = max(e.rating for e in tier)
+        if slot is None or slot.best is None or self.cap is None:
+            fit = [e for e in tier if e.rating == top]
+            best, weight = top, 1
+        else:
+            best, weight = slot.best, slot.weight
+            limit = self.cap - self.RESERVE * slot.remaining
+            fit = [e for e in tier if self.loss + weight * max(0, best - e.rating) <= limit]
+            if not fit:
+                fit = [e for e in tier if e.rating == top]
+
+        def cost(e: ModelEntry):
+            return (self.hazard(e.provider.id) + self.LAMBDA * weight * max(0, best - e.rating),) + self.order_key(e)
+
+        return min(fit, key=cost)
+
+    def note_success(self, pid: str, entry: ModelEntry | None = None, slot: Slot | None = None) -> None:
         st = self.state[pid]
         st.calls += 1
         st.consecutive_failures = 0
         st.last_failed = False
+        st.history += (OK,)
+        if entry is not None and slot is not None and slot.best is not None:
+            self.loss += slot.weight * max(0, slot.best - entry.rating)
 
     def note_failure(self, pid: str, model: str, status: int, body) -> str:
-        """Classify one refused call; returns 'dead', 'transient' or 'model'."""
+        """Classify one refused call; returns 'dead', 'transient', 'busy' or 'model'."""
         st = self.state[pid]
         msg, code = error_message_of(body)
         low = f"{msg} {code}".lower()
@@ -597,33 +750,40 @@ class Router:
         st.consecutive_failures += 1
         st.last_failed = True
         if "refused this call" in low:
-            verdict = "transient"
+            verdict, outcome = "transient", SCHED
+        elif "budget" in low:
+            verdict, outcome = "dead", BUDGET
+        elif " is out" in low or "outage" in low:
+            verdict, outcome = "dead", OUT
         elif any(h in low for h in PERMANENT_HINTS):
-            verdict = "dead"
+            verdict, outcome = "dead", OTHER
         else:
-            verdict = "transient"
+            verdict, outcome = "transient", OTHER
+        st.history += (outcome,)
         if st.consecutive_failures >= 3:
             verdict = "dead"
         if verdict == "dead":
             st.dead = True
         return verdict
 
-    def route(self, req: dict, client_wire: str, feats: dict, requested: str | None, call):
-        """Try candidates best first until one answers. `call(entry)` makes one provider call and
-        returns (status, error body or None, result or None). Returns (entry, result, last status)."""
-        tried: set[str] = set()
+    def route(self, req: dict, client_wire: str, feats: dict, requested: str | None, call, slot: Slot | None = None):
+        """Try candidates until one answers. `call(entry)` makes one provider call and returns
+        (status, error body or None, result or None). Returns (entry, result, last status)."""
+        refused: set[str] = set()
         busy_retries = 0
         last_status = 0
-        while True:
-            cands = [c for c in self.candidates(req, client_wire, feats, requested) if c.provider.id not in tried]
+        for _ in range(self.MAX_CALLS_PER_REQUEST):
+            cands = self.candidates(req, client_wire, feats, requested)
             if not cands:
-                return None, None, last_status
-            entry = cands[0]
+                break
+            tier_of = {id(e): (self.faithful(e, feats), self.named(e, requested), e.provider.id in refused) for e in cands}
+            first = min(tier_of.values())
+            entry = self.choose([e for e in cands if tier_of[id(e)] == first], slot)
             pid = entry.provider.id
             status, err_body, result = call(entry)
             last_status = status
             if status == 200 and result is not None and result["ok"]:
-                self.note_success(pid)
+                self.note_success(pid, entry, slot)
                 return entry, result, status
             if status == 200:
                 verdict = self.note_failure(pid, entry.id, 502, None)
@@ -634,7 +794,8 @@ class Router:
                 busy_retries += 1
                 continue
             if verdict != "model":
-                tried.add(pid)
+                refused.add(pid)
+        return None, None, last_status
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1534,6 +1695,7 @@ class Aggregator:
         """(status, content type, body) for one client inference request."""
         with self.lock:
             seq = self.arrivals + 1
+            slot = self.router.slot_for(self.arrivals)
             req, feats = self.requirements_for(api, body)
             requested = body.get("model") if isinstance(body.get("model"), str) and body.get("model") not in ("", "auto") else None
             stream = body.get("stream") is True
@@ -1546,7 +1708,7 @@ class Aggregator:
                     return 200, None, parse_answer(entry.provider.wire, ans, entry.id)
                 return ans.status, ans.json(), None
 
-            entry, result, last_status = self.router.route(req, api, feats, requested, call)
+            entry, result, last_status = self.router.route(req, api, feats, requested, call, slot)
             if entry is not None:
                 log(f"#{seq} {api}{' stream' if stream else ''} -> {entry.provider.id}/{entry.id} ({entry.rating})")
                 return self.render(api, stream, result, seq)
