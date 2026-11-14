@@ -290,6 +290,131 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual([m.id for m in self.world.served_models()], ["oa-top", "oa-low", "an-mid", "ge-vis"])
 
 
+
+def brute_hazard(lo, hi, history, n_providers=10):
+    """P(next call refused | history) by direct enumeration of the generator's draw (independent of main.py)."""
+    import itertools
+    total = refused = 0.0
+    for budget in range(lo, hi + 1):
+        span = range(2, budget)
+        for count in (1, 2):
+            sets = list(itertools.combinations(span, count))
+            for s in sets:
+                for designated in (False, True):
+                    fails = set(s) if (not designated or 2 in s) else {2, *s[1:]}
+                    for outage in (None, *span):
+                        p = (1 / (hi - lo + 1)) * 0.5 / len(sets)
+                        p *= (1 / n_providers) if designated else (1 - 1 / n_providers)
+                        p *= (1 - 1 / n_providers) if outage is None else (1 / n_providers) / len(span)
+
+                        def outcome(c):
+                            if c > budget:
+                                return "budget"
+                            if outage is not None and c >= outage:
+                                return "out"
+                            return "sched" if c in fails else "ok"
+                        if all(outcome(i + 1) == h for i, h in enumerate(history)):
+                            total += p
+                            refused += p if outcome(len(history) + 1) != "ok" else 0.0
+    return refused / total
+
+
+class HazardAndGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.brief = agg.parse_brief_text(brief_text())
+        self.brief.manifest = [
+            {"id": "q1", "api": "openai", "weight": 2, "requires": {}},
+            {"id": "q2", "api": "openai", "weight": 1, "requires": {}},
+        ]
+        self.brief.best = {"q1": 1475, "q2": 1475}
+        self.world = agg.World(self.brief, "")
+        self.world.load(False)
+        self.router = agg.Router(self.world)
+        self.feats = {"tools": False, "vision": False, "json_mode": False, "max_tokens": 100, "approx_tokens": 0}
+
+    def test_hazard_matches_brute_force(self):
+        h = agg.hazard_model()
+        for pid in ("zai", "cerebras"):
+            lo, hi = agg.SCHEDULES[pid]
+            for hist in [(), ("ok",), ("ok", "ok"), ("ok", "sched"), ("ok", "sched", "ok"), ("ok", "ok", "sched", "ok")]:
+                self.assertAlmostEqual(h.hazard(pid, hist), brute_hazard(lo, hi, hist), places=12, msg=(pid, hist))
+
+    def test_first_call_is_safe_and_fallbacks(self):
+        h = agg.hazard_model()
+        for pid in agg.SCHEDULES:
+            self.assertEqual(h.hazard(pid, ()), 0.0)
+        self.assertEqual(h.hazard("unknown", ()), h.FALLBACK_FIRST)
+        self.assertEqual(h.hazard("unknown", ("ok",)), h.FALLBACK)
+        self.assertEqual(h.hazard("zai", ("ok", "sched", "sched", "sched")), h.FALLBACK)  # no scenario explains it
+        wild = h.hazard("kilol", ("ok", "other"))
+        self.assertTrue(0.0 < wild < 1.0)
+        self.assertNotEqual(wild, h.FALLBACK)
+
+    def test_loss_cap(self):
+        bound = 2 * 1475 + 1475
+        self.assertEqual(self.router.cap, bound - -(-98 * bound // 100))
+        self.brief.best = {"q1": 1475}
+        self.assertIsNone(self.router.loss_cap(self.brief))
+
+    def test_history_is_recorded(self):
+        self.router.note_success("oa")
+        self.router.note_failure("oa", "oa-top", 429, {"error": {"message": "OA refused this call"}})
+        self.router.note_failure("oa", "oa-top", 500, {"error": {"message": "upstream hiccup"}})
+        self.router.note_failure("oa", "oa-top", 429, {"error": {"message": "x", "code": "concurrent_requests"}})
+        self.assertEqual(self.router.state["oa"].history, ("ok", "sched", "other"))
+        self.router.note_failure("an", "an-mid", 429, {"error": {"message": "AN is out"}})
+        self.router.note_failure("ge", "ge-vis", 429, {"error": {"message": "GE's free-tier budget is spent"}})
+        self.assertEqual((self.router.state["an"].history, self.router.state["ge"].history), (("out",), ("budget",)))
+
+    def test_guard_trades_rating_for_a_fresh_provider_only_within_the_cap(self):
+        self.router.note_success("oa")  # oa now carries the fallback hazard, an/ge are fresh
+        tier = self.router.candidates(agg.requirements_of({}), "openai", self.feats, None)
+        slot = self.router.slot_for(0)
+        self.assertEqual((slot.weight, slot.best, slot.remaining), (2, 1475, 1))
+        self.assertEqual(self.router.choose(tier, slot).id, "an-mid")  # 2 * 5 loss fits the cap
+        self.router.loss = self.router.cap - self.router.RESERVE * slot.remaining - 9
+        self.assertEqual(self.router.choose(tier, slot).id, "oa-top")  # 10 more would not
+        self.assertEqual(self.router.choose(tier, None).id, "oa-top")  # no manifest row: top rating only
+
+    def test_hazard_and_lambda_tie_break(self):
+        tier = self.router.candidates(agg.requirements_of({}), "openai", self.feats, None)
+        self.assertEqual(self.router.choose(tier, self.router.slot_for(0)).id, "oa-top")  # all fresh: no gap wins
+
+    def test_scheduled_refusal_skips_provider_unless_alone(self):
+        calls = []
+        script = {"oa": [429], "an": [], "ge": [429]}
+
+        def call(entry):
+            pid = entry.provider.id
+            calls.append(pid)
+            if script[pid]:
+                return script[pid].pop(0), {"error": {"message": f"{pid} refused this call"}}, None
+            return 200, None, {"ok": True}
+
+        entry, _, _ = self.router.route(agg.requirements_of({}), "openai", self.feats, None, call, self.router.slot_for(0))
+        self.assertEqual(calls, ["oa", "an"])  # not straight back to oa
+        self.assertEqual(self.router.loss, 2 * 5)
+        calls.clear()
+        entry, _, _ = self.router.route(agg.requirements_of({"min_context": 300000}), "openai", self.feats, None, call, self.router.slot_for(1))
+        self.assertEqual((calls, entry.id), (["ge", "ge"], "ge-vis"))  # the only candidate is retried
+
+    def test_permanent_refusal_retires(self):
+        calls = []
+
+        def call(entry):
+            calls.append(entry.provider.id)
+            if entry.provider.id == "oa":
+                return 429, {"error": {"message": "OA is out"}}, None
+            return 200, None, {"ok": True}
+
+        req = agg.requirements_of({"json": True})
+        self.router.route(req, "openai", self.feats, None, call, self.router.slot_for(0))
+        self.router.route(req, "openai", self.feats, None, call, self.router.slot_for(1))
+        self.assertEqual(calls[:2], ["oa", "an"])
+        self.assertEqual(calls[2], "ge")  # the dead provider is never called again; ge is fresh and fits the cap
+        self.assertTrue(self.router.state["oa"].dead)
+
+
 class RouterTests(unittest.TestCase):
     def setUp(self):
         self.host = FakeHost()

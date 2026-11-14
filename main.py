@@ -521,8 +521,8 @@ class HazardModel:
     outage start or none) is enumerated once with its probability and folded into a distribution
     over outcome sequences for calls 1..B+1 (the last is always the budget refusal). The hazard of
     a history is then the posterior mass of the sequences extending it whose next outcome is a
-    refusal. Unknown providers, unclassified outcomes and histories no scenario explains get a
-    conservative fallback."""
+    refusal. An unclassified outcome (a 5xx, an unparseable answer) matches any scheduled one at
+    its position. Unknown providers and histories no scenario explains get a conservative fallback."""
 
     FALLBACK_FIRST = 0.0
     FALLBACK = 0.3
@@ -579,9 +579,15 @@ class HazardModel:
         if paths is None:
             return self.FALLBACK_FIRST if not history else self.FALLBACK
         n = len(history)
+        if OTHER in history:  # an unclassified refusal spent a call: any scheduled outcome fits it
+            def fits(seq):
+                return all(h == OTHER or h == s for h, s in zip(history, seq))
+        else:
+            def fits(seq):
+                return seq[:n] == history
         total = refused = 0.0
         for seq, p in paths:
-            if len(seq) > n and seq[:n] == history:
+            if len(seq) > n and fits(seq):
                 total += p
                 if seq[n] != OK:
                     refused += p
